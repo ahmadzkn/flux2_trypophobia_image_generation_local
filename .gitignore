@@ -1,0 +1,53 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Models (large files, download separately)
+models/
+
+# Generated images
+generated_images/
+
+# Logs
+*.log
+run_log.txt
+
+# Allow requirements.txt
+!requirements.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Hugging Face cache
+.cache/

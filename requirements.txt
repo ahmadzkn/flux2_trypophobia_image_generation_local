@@ -1,0 +1,30 @@
+# Flux 2 Klein 9B - GGUF Q4 Quantization
+# Requires PyTorch nightly with CUDA 12.8 for RTX 5080 (Blackwell/sm_120)
+
+# Core Dependencies
+--extra-index-url https://download.pytorch.org/whl/nightly/cu128
+torch>=2.11.0.dev
+torchvision>=0.25.0.dev
+torchaudio>=2.11.0.dev
+
+# Diffusers (from git for GGUF support)
+diffusers @ git+https://github.com/huggingface/diffusers.git
+
+# Transformers and related
+transformers>=5.0.0
+accelerate>=0.34.0
+safetensors>=0.7.0
+
+# Hugging Face Hub
+huggingface_hub>=1.3.5
+
+# GGUF support
+gguf>=0.17.1
+
+# torchao (for alternative quantization methods)
+torchao>=0.15.0
+
+# Utilities
+pillow>=12.0.0
+numpy>=2.3.0
+tqdm>=4.67.0
