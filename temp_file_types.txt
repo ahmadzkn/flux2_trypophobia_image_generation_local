@@ -1,0 +1,4 @@
+(no extension)
+.gif
+.gifv
+.jpgt

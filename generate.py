@@ -6,6 +6,9 @@ import time
 import shutil
 import re
 
+import gc
+from optimum.quanto import freeze, qfloat8, quantize
+
 # Workaround for RTX 5080 (Blackwell) with PyTorch 2.6+cu124:
 # Disable optimized kernels that cause "no kernel image is available"
 torch.backends.cuda.enable_flash_sdp(False)
@@ -19,9 +22,9 @@ LOCAL_MODEL_PATH = os.path.join(MODELS_DIR, "flux-2-klein-9b")
 OUTPUT_DIR = "generated_images"
 
 # --- USER CONFIGURATION ---
-NUM_IMAGES = 10
+NUM_IMAGES = 100
 CLEAN_OUTPUT_DIR = False  # Set to True to clear generated_images folder before running
-KEYWORDS_FILE = "keywords_trypophobia.md" # Change to "keywords_futuristic.md" or other files
+KEYWORDS_FILE = "keywords_trypophobia_v4.md" # Change to "keywords_futuristic.md" or other files
 # --------------------------
 
 # Create or clean output directory
@@ -123,7 +126,15 @@ def generate_images(num_images=5):
             torch_dtype=torch.bfloat16,
         )
         
+        # Quantize Qwen3 (text_encoder) to FP8 to save ~8GB of memory
+        # FLUX.2 Klein uses a single ~16GB text encoder (Qwen3)
+        print("Status: Quantizing Qwen3 text encoder to FP8...")
+        quantize(pipe.text_encoder, weights=qfloat8)
+        freeze(pipe.text_encoder)
+
+        # Performance and VRAM optimizations
         pipe.enable_model_cpu_offload()
+        # Note: VAE tiling and attention slicing are currently unsupported by this specific custom pipeline
         
     except Exception as e:
         import traceback
@@ -153,6 +164,10 @@ def generate_images(num_images=5):
         print(f"Resuming sequence from index: {current_sequence}")
 
     for i in range(num_images):
+        # Explicitly clear memory and cache each iteration to prevent spikes
+        gc.collect()
+        torch.cuda.empty_cache()
+        
         keyword = random.choice(keywords)
         template = random.choice(templates)
         

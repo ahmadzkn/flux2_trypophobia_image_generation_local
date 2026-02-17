@@ -8,6 +8,9 @@ models/
 
 # Generated images
 generated_images/
+downloaded/
+downloaded_trypo/
+subreddit_json/
 
 # Logs
 *.log
