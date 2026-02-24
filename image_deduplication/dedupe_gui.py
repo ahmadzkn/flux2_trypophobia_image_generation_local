@@ -62,11 +62,18 @@ class DedupeApp(ctk.CTk):
         self.detector = None
         self.clusters = []
         self.current_cluster_idx = -1
+        self.processed_clusters = set()
         self.image_objects = [] # To prevent GC
         self.selected_indices = set()
         self.source_dir = ""
+        
+        # Pagination for large groups
+        self.page_size = 50
+        self.current_page = 0
 
         self._setup_ui()
+        self.bind("<Left>", self.prev_cluster)
+        self.bind("<Right>", self.next_cluster)
 
     def _setup_ui(self):
         # Sidebar
@@ -79,9 +86,9 @@ class DedupeApp(ctk.CTk):
         self.scan_button = ctk.CTkButton(self.sidebar, text="Scan Folder", command=self.select_folder)
         self.scan_button.pack(padx=20, pady=10)
 
-        self.threshold_label = ctk.CTkLabel(self.sidebar, text="pHash Threshold (0-10)")
+        self.threshold_label = ctk.CTkLabel(self.sidebar, text="pHash Threshold: 5")
         self.threshold_label.pack(padx=20, pady=(20, 0))
-        self.phash_threshold = ctk.CTkSlider(self.sidebar, from_=0, to=20, number_of_steps=20)
+        self.phash_threshold = ctk.CTkSlider(self.sidebar, from_=0, to=20, number_of_steps=20, command=self.update_threshold_label)
         self.phash_threshold.set(5)
         self.phash_threshold.pack(padx=20, pady=5)
 
@@ -120,17 +127,39 @@ class DedupeApp(ctk.CTk):
         self.action_frame = ctk.CTkFrame(self.main_frame, height=100)
         self.action_frame.pack(fill="x", side="bottom", padx=10, pady=10)
 
+        self.prev_btn = ctk.CTkButton(self.action_frame, text="< Prev", command=self.prev_cluster, state="disabled", width=60)
+        self.prev_btn.pack(side="left", padx=(20, 5), pady=20)
+
         self.keep_selected_btn = ctk.CTkButton(self.action_frame, text="Keep Selected & Trash Others", 
                                                 command=self.keep_selected, state="disabled", fg_color="green", hover_color="#006400")
-        self.keep_selected_btn.pack(side="left", padx=20, pady=20, expand=True)
+        self.keep_selected_btn.pack(side="left", padx=5, pady=20, expand=True)
 
-        self.keep_all_btn = ctk.CTkButton(self.action_frame, text="Keep All (Move Next)", 
+        self.keep_all_btn = ctk.CTkButton(self.action_frame, text="Keep All", 
                                            command=self.keep_all, state="disabled")
-        self.keep_all_btn.pack(side="left", padx=20, pady=20, expand=True)
+        self.keep_all_btn.pack(side="left", padx=5, pady=20, expand=True)
 
         self.trash_all_btn = ctk.CTkButton(self.action_frame, text="Trash All", 
                                             command=self.trash_all, state="disabled", fg_color="red", hover_color="#8B0000")
-        self.trash_all_btn.pack(side="left", padx=20, pady=20, expand=True)
+        self.trash_all_btn.pack(side="left", padx=5, pady=20, expand=True)
+
+        self.next_btn = ctk.CTkButton(self.action_frame, text="Next >", command=self.next_cluster, state="disabled", width=60)
+        self.next_btn.pack(side="left", padx=(5, 20), pady=20)
+        
+        # Pagination Controls
+        self.pagination_frame = ctk.CTkFrame(self.main_frame, height=40, fg_color="transparent")
+        self.pagination_frame.pack(fill="x", side="bottom", padx=10, pady=(0, 10))
+        
+        self.page_prev_btn = ctk.CTkButton(self.pagination_frame, text="< Prev Page", command=self.prev_page, state="disabled", width=100)
+        self.page_prev_btn.pack(side="left", padx=20)
+        
+        self.page_label = ctk.CTkLabel(self.pagination_frame, text="Page 1/1")
+        self.page_label.pack(side="left", expand=True)
+        
+        self.page_next_btn = ctk.CTkButton(self.pagination_frame, text="Next Page >", command=self.next_page, state="disabled", width=100)
+        self.page_next_btn.pack(side="right", padx=20)
+
+    def update_threshold_label(self, value):
+        self.threshold_label.configure(text=f"pHash Threshold: {int(value)}")
 
     def select_folder(self):
         folder = filedialog.askdirectory()
@@ -205,11 +234,29 @@ class DedupeApp(ctk.CTk):
                     return None, path
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
-                for i in range(0, total, batch_size):
-                    batch_files = files[i:i + batch_size]
-                    
-                    # 2a. Parallel Load from Disk (Disk/CPU bound)
-                    results = list(executor.map(load_image_only, batch_files))
+                def iter_batches():
+                    for i in range(0, total, batch_size):
+                        yield i, files[i:i + batch_size]
+                
+                batch_iterator = iter_batches()
+
+                try:
+                    current_i, current_batch_files = next(batch_iterator)
+                    current_futures = [executor.submit(load_image_only, f) for f in current_batch_files]
+                except StopIteration:
+                    current_futures = None
+
+                while current_futures is not None:
+                    # Pre-submit the NEXT batch to keep workers busy while GPU infers
+                    try:
+                        next_i, next_batch_files = next(batch_iterator)
+                        next_futures = [executor.submit(load_image_only, f) for f in next_batch_files]
+                    except StopIteration:
+                        next_futures = None
+                        next_i = None
+
+                    # 2a. Realize the current batch (Wait for it to finish loading)
+                    results = [f.result() for f in current_futures]
                     
                     batch_imgs = []
                     valid_batch_paths = []
@@ -248,17 +295,21 @@ class DedupeApp(ctk.CTk):
                             for idx in range(len(batch_outputs)):
                                 embeddings[valid_batch_paths[idx]] = batch_outputs[idx].flatten()
                             
-                            print(f"CLIP Scan: Batch {i//batch_size + 1} | Processed {len(batch_outputs)} images")
+                            print(f"CLIP Scan: Batch {current_i//batch_size + 1} | Processed {len(batch_outputs)} images")
                         except Exception as e:
-                            print(f"  [CLIP Error] Batch {i//batch_size + 1} failed: {e}")
+                            print(f"  [CLIP Error] Batch {current_i//batch_size + 1} failed: {e}")
                             # Fallback: try images one by one if the whole batch crashed (unlikely but safe)
                     else:
-                        print(f"CLIP Scan: Batch {i//batch_size + 1} | SKIPPED (No valid images in this block)")
+                        print(f"CLIP Scan: Batch {current_i//batch_size + 1} | SKIPPED (No valid images in this block)")
 
                     # Update UI progress
-                    self.progress_bar.set(0.5 + ((min(i + batch_size, total) / total) * 0.5))
-                    self.after(0, lambda curr=min(i+batch_size, total), t=total: 
+                    self.progress_bar.set(0.5 + ((min(current_i + batch_size, total) / total) * 0.5))
+                    self.after(0, lambda curr=min(current_i+batch_size, total), t=total: 
                                self.progress_label.configure(text=f"CLIP AI Scanning {curr}/{t}"))
+
+                    # Move to next batch
+                    current_futures = next_futures
+                    current_i = next_i
 
             print(f"--- AI SCAN COMPLETE: Stored {len(embeddings)} embeddings ---")
             if len(embeddings) == 0:
@@ -394,8 +445,10 @@ class DedupeApp(ctk.CTk):
         dev_text = f"Device: {self.detector.device.upper()}"
         self.device_label.configure(text=dev_text)
         self.progress_label.configure(text=f"Done! Found {len(self.clusters)} groups.")
+        self.processed_clusters.clear()
         if self.clusters:
             self.current_cluster_idx = 0
+            self.current_page = 0
             self.show_cluster()
         else:
             messagebox.showinfo("Scan Complete", "No duplicates found with current threshold.")
@@ -404,6 +457,12 @@ class DedupeApp(ctk.CTk):
         if self.current_cluster_idx >= len(self.clusters):
             messagebox.showinfo("Finished", "All duplicates have been reviewed!")
             self.header_label.configure(text="Review complete.")
+            self.keep_selected_btn.configure(state="disabled")
+            self.keep_all_btn.configure(state="disabled")
+            self.trash_all_btn.configure(state="disabled")
+            if hasattr(self, 'next_btn'): self.next_btn.configure(state="disabled")
+            if self.current_cluster_idx > 0 and hasattr(self, 'prev_btn'):
+                self.prev_btn.configure(state="normal")
             return
 
         # Clear grid (safely destroy only image containers)
@@ -414,17 +473,61 @@ class DedupeApp(ctk.CTk):
         self.selected_indices = set()
         
         cluster = self.clusters[self.current_cluster_idx]
-        self.header_label.configure(text=f"Group {self.current_cluster_idx + 1} of {len(self.clusters)} (Found {len(cluster)} images)")
+        
+        # Navigation Buttons Update
+        if hasattr(self, 'prev_btn'):
+            self.prev_btn.configure(state="normal" if self.current_cluster_idx > 0 else "disabled")
+        if hasattr(self, 'next_btn'):
+            self.next_btn.configure(state="normal" if self.current_cluster_idx < len(self.clusters) - 1 else "disabled")
 
-        # Enable Buttons
-        self.keep_selected_btn.configure(state="normal")
-        self.keep_all_btn.configure(state="normal")
-        self.trash_all_btn.configure(state="normal")
+        # Processed status checking
+        if self.current_cluster_idx in self.processed_clusters:
+            self.header_label.configure(text=f"Group {self.current_cluster_idx + 1} of {len(self.clusters)} (Processed)")
+            self.keep_selected_btn.configure(state="disabled")
+            self.keep_all_btn.configure(state="disabled")
+            self.trash_all_btn.configure(state="disabled")
+        else:
+            self.header_label.configure(text=f"Group {self.current_cluster_idx + 1} of {len(self.clusters)} (Found {len(cluster)} images)")
+            self.keep_selected_btn.configure(state="normal")
+            self.keep_all_btn.configure(state="normal")
+            self.trash_all_btn.configure(state="normal")
 
-        for i, path in enumerate(cluster):
-            self.add_image_to_grid(path, i)
+        # Pagination Logic
+        total_images = len(cluster)
+        total_pages = (total_images + self.page_size - 1) // self.page_size
+        
+        if self.current_page >= total_pages:
+            self.current_page = max(0, total_pages - 1)
+            
+        start_idx = self.current_page * self.page_size
+        end_idx = min(start_idx + self.page_size, total_images)
+        
+        self.page_label.configure(text=f"Page {self.current_page + 1}/{max(1, total_pages)} (Showing {start_idx+1}-{end_idx})")
+        
+        if hasattr(self, 'page_prev_btn'):
+            self.page_prev_btn.configure(state="normal" if self.current_page > 0 else "disabled")
+        if hasattr(self, 'page_next_btn'):
+            self.page_next_btn.configure(state="normal" if self.current_page < total_pages - 1 else "disabled")
 
-    def add_image_to_grid(self, path, idx):
+        page_cluster = cluster[start_idx:end_idx]
+
+        for i, path in enumerate(page_cluster):
+            # Pass the absolute index for selection tracking, but relative i for grid placement
+            self.add_image_to_grid(path, i, absolute_idx=start_idx + i)
+
+    def prev_page(self):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.show_cluster()
+            
+    def next_page(self):
+        cluster = self.clusters[self.current_cluster_idx]
+        total_pages = (len(cluster) + self.page_size - 1) // self.page_size
+        if self.current_page < total_pages - 1:
+            self.current_page += 1
+            self.show_cluster()
+
+    def add_image_to_grid(self, path, grid_idx, absolute_idx):
         try:
             # Stats
             size_kb = os.path.getsize(path) / 1024
@@ -441,13 +544,18 @@ class DedupeApp(ctk.CTk):
 
             # Container (3 columns for better fit on 1200px width)
             container = ctk.CTkFrame(self.grid_container)
-            container.grid(row=idx // 3, column=idx % 3, padx=10, pady=10, sticky="nsew")
+            container.grid(row=grid_idx // 3, column=grid_idx % 3, padx=10, pady=10, sticky="nsew")
+
+            # Restore Selection State if it was selected on a previous viewing of this page
+            if absolute_idx in self.selected_indices:
+                container.configure(fg_color="#1f538d")
 
             # Image Label (Clickable)
             img_label = tk.Label(container, image=img, bg="#2b2b2b")
             img_label.pack(pady=5)
-            img_label.bind("<Button-1>", lambda e, i=idx, c=container: self.toggle_selection(i, c))
+            img_label.bind("<Button-1>", lambda e, i=absolute_idx, c=container: self.toggle_selection(i, c))
             img_label.bind("<Button-3>", lambda e, p=path, c=container: self.on_right_click(p, c))
+            img_label.bind("<Double-Button-1>", lambda e, p=path: self.open_image_viewer(p))
 
             # Info Labels
             info = f"{os.path.basename(path)}\n{res} | {size_kb:.1f} KB"
@@ -455,6 +563,74 @@ class DedupeApp(ctk.CTk):
 
         except Exception as e:
             print(f"Error loading {path}: {e}")
+
+    def open_image_viewer(self, path):
+        viewer = ctk.CTkToplevel(self)
+        viewer.title(f"Viewing: {os.path.basename(path)}")
+        viewer.geometry("800x800")
+        viewer.focus()
+        
+        try:
+            img = Image.open(path)
+            viewer.original_image = img
+            viewer.zoom_factor = 1.0
+            
+            canvas = tk.Canvas(viewer, bg="#1e1e1e", highlightthickness=0)
+            canvas.pack(fill="both", expand=True)
+            
+            viewer.img_id = None
+            viewer.cx, viewer.cy = 400, 400
+            
+            def render():
+                w, h = viewer.original_image.size
+                new_w = max(1, int(w * viewer.zoom_factor))
+                new_h = max(1, int(h * viewer.zoom_factor))
+                resized = viewer.original_image.resize((new_w, new_h), Image.Resampling.NEAREST)
+                viewer.tk_img = ImageTk.PhotoImage(resized)
+                
+                if viewer.img_id is not None:
+                    canvas.delete(viewer.img_id)
+                viewer.img_id = canvas.create_image(viewer.cx, viewer.cy, image=viewer.tk_img, anchor="center")
+            
+            def init_render(event=None):
+                if viewer.img_id is None:
+                    cw, ch = canvas.winfo_width(), canvas.winfo_height()
+                    w, h = viewer.original_image.size
+                    viewer.cx, viewer.cy = cw//2, ch//2
+                    if w > 0 and h > 0:
+                        viewer.zoom_factor = min(cw/w, ch/h)
+                    render()
+            
+            canvas.bind("<Configure>", init_render)
+            
+            def on_mousewheel(event):
+                if event.delta > 0:
+                    viewer.zoom_factor *= 1.2
+                else:
+                    viewer.zoom_factor /= 1.2
+                render()
+                
+            viewer.bind("<MouseWheel>", on_mousewheel)
+            
+            viewer.drag_data = {"x": 0, "y": 0}
+            def on_drag_start(event):
+                viewer.drag_data["x"] = event.x
+                viewer.drag_data["y"] = event.y
+            def on_drag_motion(event):
+                dx = event.x - viewer.drag_data["x"]
+                dy = event.y - viewer.drag_data["y"]
+                viewer.cx += dx
+                viewer.cy += dy
+                if viewer.img_id is not None:
+                    canvas.move(viewer.img_id, dx, dy)
+                viewer.drag_data["x"] = event.x
+                viewer.drag_data["y"] = event.y
+                
+            canvas.bind("<ButtonPress-1>", on_drag_start)
+            canvas.bind("<B1-Motion>", on_drag_motion)
+            
+        except Exception as e:
+            print(f"Error opening viewer for {path}: {e}")
 
     def toggle_selection(self, idx, container):
         """Toggle blue tint and add to selected list."""
@@ -466,20 +642,47 @@ class DedupeApp(ctk.CTk):
             container.configure(fg_color="#1f538d") 
 
     def on_right_click(self, path, container):
+        if hasattr(self, 'processed_clusters') and self.current_cluster_idx in self.processed_clusters:
+            return
+
         if messagebox.askyesno("Confirm Delete", f"Move {os.path.basename(path)} to trash?"):
-            self.move_to_trash([path])
-            # Remove from current cluster
             cluster = self.clusters[self.current_cluster_idx]
             if path in cluster:
                 cluster.remove(path)
+            self.move_to_trash([path])
             
-            # If cluster has <= 1 image, it's no longer a group of duplicates
             if len(cluster) <= 1:
-                self.clusters.pop(self.current_cluster_idx)
-                # Don't increment index, just show whatever is now at this index
+                self.processed_clusters.add(self.current_cluster_idx)
+            
+            self.show_cluster()
+
+    def prev_cluster(self, event=None):
+        if hasattr(self, 'prev_btn') and self.prev_btn.cget("state") == "normal":
+            self.current_cluster_idx -= 1
+            self.current_page = 0
+            if self.current_cluster_idx < 0:
+                self.current_cluster_idx = 0
+            self.show_cluster()
+
+    def next_cluster(self, event=None):
+        if hasattr(self, 'next_btn') and self.next_btn.cget("state") == "normal":
+            self.current_page = 0
+            if self.current_cluster_idx < len(self.clusters) - 1:
+                self.current_cluster_idx += 1
                 self.show_cluster()
             else:
                 self.show_cluster()
+
+    def update_cluster_paths(self, old_new_pairs):
+        if not hasattr(self, 'current_cluster_idx') or self.current_cluster_idx < 0:
+            return
+        if self.current_cluster_idx >= len(self.clusters):
+            return
+        cluster = self.clusters[self.current_cluster_idx]
+        for old_p, new_p in old_new_pairs:
+            for i in range(len(cluster)):
+                if cluster[i] == old_p:
+                    cluster[i] = new_p
 
     def keep_selected(self):
         if not self.selected_indices:
@@ -487,34 +690,54 @@ class DedupeApp(ctk.CTk):
             return
         
         cluster = self.clusters[self.current_cluster_idx]
+        to_keep = [path for i, path in enumerate(cluster) if i in self.selected_indices]
         to_trash = [path for i, path in enumerate(cluster) if i not in self.selected_indices]
         
+        self.move_to_deduplicated(to_keep)
         self.move_to_trash(to_trash)
+        self.processed_clusters.add(self.current_cluster_idx)
         self.next_cluster()
 
     def keep_all(self):
+        self.move_to_deduplicated(self.clusters[self.current_cluster_idx])
+        self.processed_clusters.add(self.current_cluster_idx)
         self.next_cluster()
 
     def trash_all(self):
         if messagebox.askyesno("Confirm", "Are you sure you want to trash ALL images in this group?"):
             self.move_to_trash(self.clusters[self.current_cluster_idx])
+            self.processed_clusters.add(self.current_cluster_idx)
             self.next_cluster()
 
     def move_to_trash(self, paths):
         trash_dir = os.path.join(self.source_dir, "_Trash")
         os.makedirs(trash_dir, exist_ok=True)
+        new_paths = []
         for p in paths:
             try:
                 dest = os.path.join(trash_dir, os.path.basename(p))
                 if os.path.exists(dest):
                     dest = os.path.join(trash_dir, f"{int(time.time())}_{os.path.basename(p)}")
                 shutil.move(p, dest)
+                new_paths.append((p, dest))
             except Exception as e:
                 print(f"Error trashing {p}: {e}")
+        self.update_cluster_paths(new_paths)
 
-    def next_cluster(self):
-        self.current_cluster_idx += 1
-        self.show_cluster()
+    def move_to_deduplicated(self, paths):
+        dedupe_dir = os.path.join(self.source_dir, "deDuplicated")
+        os.makedirs(dedupe_dir, exist_ok=True)
+        new_paths = []
+        for p in paths:
+            try:
+                dest = os.path.join(dedupe_dir, os.path.basename(p))
+                if os.path.exists(dest):
+                    dest = os.path.join(dedupe_dir, f"{int(time.time())}_{os.path.basename(p)}")
+                shutil.move(p, dest)
+                new_paths.append((p, dest))
+            except Exception as e:
+                print(f"Error moving {p} to deDuplicated: {e}")
+        self.update_cluster_paths(new_paths)
 
 if __name__ == "__main__":
     app = DedupeApp()
