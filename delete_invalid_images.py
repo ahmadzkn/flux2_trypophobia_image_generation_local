@@ -1,4 +1,5 @@
 import os
+from PIL import Image
 
 def delete_invalid_images(file_list_path, dry_run=True):
     """
@@ -104,6 +105,51 @@ def delete_files_by_extension(directory_path, extensions, dry_run=True):
     if error_count > 0:
         print(f"Errors: {error_count}")
 
+def delete_small_images(directory_path, min_dim=440, dry_run=True):
+    """
+    Deletes images in directory_path if any dimension is smaller than min_dim.
+    """
+    if not os.path.exists(directory_path):
+        print(f"Error: {directory_path} not found.")
+        return
+
+    deleted_count = 0
+    error_count = 0
+    skipped_count = 0
+
+    print(f"{'DRY RUN: ' if dry_run else ''}Scanning for images smaller than {min_dim}px in {directory_path}...")
+
+    for filename in os.listdir(directory_path):
+        path = os.path.join(directory_path, filename)
+        if os.path.isfile(path) and filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp')):
+            try:
+                with Image.open(path) as img:
+                    width, height = img.size
+                
+                if width < min_dim or height < min_dim:
+                    if dry_run:
+                        print(f"[DRY RUN] Would delete (Small: {width}x{height}): {path}")
+                        deleted_count += 1
+                    else:
+                        try:
+                            os.remove(path)
+                            print(f"Deleted (Small: {width}x{height}): {path}")
+                            deleted_count += 1
+                        except Exception as e:
+                            print(f"Error deleting {path}: {e}")
+                            error_count += 1
+            except Exception as e:
+                # Not an image or corrupted
+                skipped_count += 1
+        else:
+            skipped_count += 1
+
+    print(f"\nSummary:")
+    print(f"{'Would be deleted' if dry_run else 'Deleted'}: {deleted_count}")
+    print(f"Skipped (Non-image or Error): {skipped_count}")
+    if error_count > 0:
+        print(f"Errors: {error_count}")
+
 def get_extensions_from_file(file_path):
     """Reads extensions from a file, one per line."""
     if not os.path.exists(file_path):
@@ -115,7 +161,7 @@ if __name__ == "__main__":
     import sys
     
     INVALID_IMAGES_FILE = "invalid_images.txt"
-    IMAGE_DIR = "downloaded_trypo"
+    IMAGE_DIR = "downloaded"
     TYPES_FILE = "temp_file_types.txt"
 
     # Handle command line arguments
@@ -156,8 +202,19 @@ if __name__ == "__main__":
         else:
             print(f"{INVALID_IMAGES_FILE} not found.")
 
+    elif "--delete-small" in args:
+        # Step 4: Small image deletion
+        print("\n--- Small Image Deletion Start (<440px) ---")
+        delete_small_images(IMAGE_DIR, min_dim=440, dry_run=True)
+        print("--- Small Image Deletion End ---\n")
+        
+        confirm = input(f"Confirm deletion of images smaller than 440px in {IMAGE_DIR}? (y/N): ").lower()
+        if confirm == 'y':
+            delete_small_images(IMAGE_DIR, min_dim=440, dry_run=False)
+
     else:
         print("Usage:")
         print("  python delete_invalid_images.py --scan           # Scan unique file types")
         print("  python delete_invalid_images.py --delete-types   # Delete files with extensions in temp_file_types.txt")
         print("  python delete_invalid_images.py --delete-invalid # Delete files listed in invalid_images.txt")
+        print("  python delete_invalid_images.py --delete-small   # Delete images smaller than 440px")

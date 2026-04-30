@@ -6,7 +6,8 @@ import customtkinter as ctk
 from PIL import Image, ImageTk
 import imagehash
 import torch
-from transformers import CLIPProcessor, CLIPModel
+import torchvision.transforms as transforms
+from transformers import AutoImageProcessor, AutoModel
 from threading import Thread
 import concurrent.futures
 import time
@@ -16,39 +17,19 @@ ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
 class DuplicateDetector:
-    def __init__(self, use_clip=True):
-        self.use_clip = use_clip
+    def __init__(self, use_dinov2=True):
+        self.use_dinov2 = use_dinov2
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        if use_clip:
-            print("Loading CLIP model...")
-            self.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(self.device)
-            self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        if use_dinov2:
+            print("Loading DinoV2 model (Replacing SSCD due to Meta server 403 error)...")
+            self.processor = AutoImageProcessor.from_pretrained('facebook/dinov2-base')
+            self.model = AutoModel.from_pretrained('facebook/dinov2-base').to(self.device)
+            self.model.eval()
         
     def get_phash(self, image_path):
         try:
             with Image.open(image_path) as img:
                 return str(imagehash.phash(img))
-        except Exception:
-            return None
-
-    def get_clip_embedding(self, image_path):
-        try:
-            with Image.open(image_path) as img:
-                inputs = self.processor(images=img, return_tensors="pt").to(self.device)
-                with torch.no_grad():
-                    outputs = self.model.get_image_features(**inputs)
-                
-                if isinstance(outputs, torch.Tensor):
-                    return outputs.cpu().numpy().flatten()
-                elif hasattr(outputs, "image_embeds"):
-                    return outputs.image_embeds.cpu().numpy().flatten()
-                elif hasattr(outputs, "pooler_output"):
-                    return outputs.pooler_output.cpu().numpy().flatten()
-                else:
-                    try:
-                        return outputs[0].cpu().numpy().flatten()
-                    except:
-                        return outputs.last_hidden_state[:, 0, :].cpu().numpy().flatten()
         except Exception:
             return None
 
@@ -107,9 +88,9 @@ class DedupeApp(ctk.CTk):
         self.phash_threshold.set(5)
         self.phash_threshold.pack(padx=20, pady=5)
 
-        self.clip_var = tk.BooleanVar(value=True)
-        self.clip_checkbox = ctk.CTkCheckBox(self.sidebar, text="Use CLIP (AI)", variable=self.clip_var)
-        self.clip_checkbox.pack(padx=20, pady=20)
+        self.dinov2_var = tk.BooleanVar(value=True)
+        self.dinov2_checkbox = ctk.CTkCheckBox(self.sidebar, text="Use DinoV2 (AI)", variable=self.dinov2_var)
+        self.dinov2_checkbox.pack(padx=20, pady=20)
 
         self.progress_label = ctk.CTkLabel(self.sidebar, text="Ready")
         self.progress_label.pack(padx=20, pady=(20, 0))
@@ -192,8 +173,8 @@ class DedupeApp(ctk.CTk):
         Thread(target=self.run_scan, daemon=True).start()
 
     def run_scan(self):
-        if not self.detector or (self.detector.use_clip != self.clip_var.get()):
-            self.detector = DuplicateDetector(use_clip=self.clip_var.get())
+        if not self.detector or (self.detector.use_dinov2 != self.dinov2_var.get()):
+            self.detector = DuplicateDetector(use_dinov2=self.dinov2_var.get())
 
         # 0. Global Safety Settings
         from PIL import Image
@@ -235,18 +216,17 @@ class DedupeApp(ctk.CTk):
                     self.after(0, lambda c=completed, t=total: 
                                self.progress_label.configure(text=f"Hashing {c}/{t}"))
 
-        # 2. Calculate CLIP Embeddings (Parallel Load + Batch Processing)
-        if self.clip_var.get():
-            batch_size = 256
-            print(f"--- Starting hardware-accelerated CLIP scanning (batch size: {batch_size}) ---")
+        # 2. Calculate AI Embeddings (Parallel Load + Batch Processing)
+        if self.dinov2_var.get():
+            batch_size = 128
+            print(f"--- Starting hardware-accelerated DinoV2 scanning (batch size: {batch_size}) ---")
             
             # Use threads ONLY for the slow disk loading part
             def load_image_only(path):
                 try:
                     with Image.open(path) as img:
-                        # Pre-convert and pre-resize on CPU to save memory and speed up
                         img_rgb = img.convert("RGB")
-                        img_rgb.thumbnail((250, 250)) 
+                        img_rgb.thumbnail((250, 250))
                         return img_rgb, path
                 except Exception as e:
                     print(f"  [DEBUG] Error loading {os.path.basename(path)}: {e}")
@@ -291,40 +271,27 @@ class DedupeApp(ctk.CTk):
                     # 2b. Batch Preprocess and GPU Inference (Main thread for stability)
                     if batch_imgs:
                         try:
-                            # Processor is much faster when processing a list of images at once
                             inputs = self.detector.processor(images=batch_imgs, return_tensors="pt").to(self.detector.device)
                             
                             with torch.no_grad():
-                                outputs = self.detector.model.get_image_features(**inputs)
+                                outputs = self.detector.model(**inputs)
                             
-                            # Extremely robust extraction for different CLIP output formats
-                            if isinstance(outputs, torch.Tensor):
-                                batch_outputs = outputs.cpu().numpy()
-                            elif hasattr(outputs, "image_embeds"):
-                                batch_outputs = outputs.image_embeds.cpu().numpy()
-                            elif hasattr(outputs, "pooler_output"):
-                                batch_outputs = outputs.pooler_output.cpu().numpy()
-                            else:
-                                # Final fallback for dict-like or wrapped outputs
-                                try:
-                                    batch_outputs = outputs[0].cpu().numpy()
-                                except:
-                                    batch_outputs = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+                            # Extract CLS token as global descriptor
+                            batch_outputs = outputs.last_hidden_state[:, 0, :].cpu().numpy()
                             
                             for idx in range(len(batch_outputs)):
                                 embeddings[valid_batch_paths[idx]] = batch_outputs[idx].flatten()
                             
-                            print(f"CLIP Scan: Batch {current_i//batch_size + 1} | Processed {len(batch_outputs)} images")
+                            print(f"DinoV2 Scan: Batch {current_i//batch_size + 1} | Processed {len(batch_outputs)} images")
                         except Exception as e:
-                            print(f"  [CLIP Error] Batch {current_i//batch_size + 1} failed: {e}")
-                            # Fallback: try images one by one if the whole batch crashed (unlikely but safe)
+                            print(f"  [DinoV2 Error] Batch {current_i//batch_size + 1} failed: {e}")
                     else:
-                        print(f"CLIP Scan: Batch {current_i//batch_size + 1} | SKIPPED (No valid images in this block)")
+                        print(f"DinoV2 Scan: Batch {current_i//batch_size + 1} | SKIPPED (No valid images in this block)")
 
                     # Update UI progress
                     self.progress_bar.set(0.5 + ((min(current_i + batch_size, total) / total) * 0.5))
                     self.after(0, lambda curr=min(current_i+batch_size, total), t=total: 
-                               self.progress_label.configure(text=f"CLIP AI Scanning {curr}/{t}"))
+                               self.progress_label.configure(text=f"DinoV2 AI Scanning {curr}/{t}"))
 
                     # Move to next batch
                     current_futures = next_futures
@@ -332,7 +299,7 @@ class DedupeApp(ctk.CTk):
 
             print(f"--- AI SCAN COMPLETE: Stored {len(embeddings)} embeddings ---")
             if len(embeddings) == 0:
-                print("WARNING: CLIP AI found 0 valid images. Clustering will fall back to pHash only.")
+                print("WARNING: DinoV2 AI found 0 valid images. Clustering will fall back to pHash only.")
 
         # 2c. Log invalid images to file
         if invalid_images:
@@ -401,11 +368,13 @@ class DedupeApp(ctk.CTk):
                 self.after(0, lambda curr=end_i, t=n_hashed: 
                            self.progress_label.configure(text=f"pHash Clustering {curr}/{t}"))
 
-        # 3b. Vectorized CLIP edges on GPU (The fast part)
-        if self.clip_var.get() and embeddings:
+        # 3b. Vectorized AI edges on GPU (The fast part)
+        if self.dinov2_var.get() and embeddings:
             self.after(0, lambda: self.progress_label.configure(text="AI Clustering..."))
             print(f"Calculating GPU Similarity Matrix (Batched: 5000)...")
-            emb_list = [embeddings.get(f, np.zeros(512)) for f in files]
+            # Get an arbitrary sample embedding to find its size (DinoV2 base is 768)
+            emb_size = len(next(iter(embeddings.values()))) if embeddings else 768
+            emb_list = [embeddings.get(f, np.zeros(emb_size)) for f in files]
             all_embs = torch.tensor(np.array(emb_list), dtype=torch.float32).to(self.detector.device)
             # Normalize
             all_embs = all_embs / (all_embs.norm(dim=1, keepdim=True) + 1e-9)
